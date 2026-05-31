@@ -77,14 +77,6 @@ ablations/            K-value and component ablations
 experiments/configs/  training configurations (JSON)
 ```
 
-## Algorithm variants
-
-| Method   | Backbone | Status            |
-| -------- | -------- | ----------------- |
-| IAIG-Nav | TD3      | **Main method**   |
-| IAIG-Nav | SAC      | Appendix variant  |
-
-The two backbones share the same encoder and IEM; only the actor-critic update rule differs.
 
 ## License
 
