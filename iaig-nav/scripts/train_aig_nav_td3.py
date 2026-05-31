@@ -1,0 +1,697 @@
+"""
+Training Script for AIG-Nav-TD3 (TD3 Version)
+
+This script trains the AIG-Nav-TD3 model for social robot navigation.
+
+Key differences from SAC version:
+1. Uses deterministic policy with exploration noise
+2. No entropy term or temperature parameter
+3. Delayed policy updates (every 2 critic updates)
+4. Target policy smoothing
+
+Usage:
+    python scripts/train_aig_nav_td3.py --render       # With visualization
+    python scripts/train_aig_nav_td3.py                # Training only
+"""
+
+import argparse
+import math
+import os
+import sys
+import time
+import random
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
+
+repo_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(repo_root))
+
+# Torch backward compatibility (system Python 3.10 has torch 2.1)
+if not hasattr(torch.amp, 'GradScaler'):
+    class _GradScalerCompat(torch.cuda.amp.GradScaler):
+        def __init__(self, device=None, **kwargs):
+            super().__init__(**kwargs)
+    torch.amp.GradScaler = _GradScalerCompat
+if not hasattr(torch, 'autocast'):
+    torch.autocast = torch.cuda.amp.autocast
+
+from aig_nav_core import AIGNavTD3, AIGNavReplayBuffer, PygameNavEnvAIGNav
+from scripts.config_utils import load_config, cfg_get
+from scripts.eval_utils import (
+    DEFAULT_EVAL_SCENARIO_SEED,
+    generate_eval_scenarios,
+    set_global_seeds,
+)
+
+
+def set_seed(seed: int, deterministic: bool = False):
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def map_action_to_cmd(action):
+    """Map neural network action to velocity command."""
+    if action[0] >= 0:
+        lin_vel = action[0]
+    else:
+        lin_vel = action[0] * 0.3
+    ang_vel = action[1]
+    return float(lin_vel), float(ang_vel)
+
+
+def format_progress_bar(current: int, total: int, width: int = 20):
+    if total <= 0:
+        return "[--------------------]", 0.0
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = int(round(ratio * width))
+    bar = "[" + "#" * filled + "-" * (width - filled) + "]"
+    return bar, ratio
+
+
+def make_progress_bar(total: int, desc: str):
+    if tqdm is None:
+        return None
+    return tqdm(total=total, desc=desc, leave=False, dynamic_ncols=True)
+
+
+def evaluate(model, eval_env, scenarios, log_step: int, max_steps, seed_base: int, eval_count: int = 0):
+    """Evaluate the model on fixed scenarios."""
+    model.sync_inference()
+    total_reward = 0.0
+    total_col = 0
+    total_goal = 0
+    total_steps = 0
+
+    rng_state_np = np.random.get_state()
+    rng_state_py = random.getstate()
+
+    for idx, scenario in enumerate(scenarios):
+        seed = seed_base + idx
+        set_global_seeds(seed)
+        obs = eval_env.reset(scenario=scenario, eval_seed=seed)
+        model.reset_episode()
+
+        episode_reward = 0.0
+        steps = 0
+
+        while steps < max_steps:
+            if obs['collision'] or obs['goal_reached']:
+                break
+
+            # Get pedestrian data
+            ped_states = obs['pedestrian_states']
+            ped_pos = ped_states['positions']
+            ped_vel = ped_states['velocities']
+            ped_hist = ped_states['histories']
+            static_obs = obs['static_obstacles']
+
+            # Prepare observation
+            scan = obs['scan']
+            distance = obs['distance']
+            cos_v = obs['cos_v']
+            sin_v = obs['sin_v']
+
+            norm_distance = min(distance / 6.0, 1.0)
+            core = np.array([norm_distance, cos_v, sin_v], dtype=np.float32)
+
+            # TD3: Get action without noise during evaluation
+            action = model.act(
+                scan,
+                core,
+                ped_pos,
+                ped_vel,
+                ped_histories=ped_hist,
+                static_obstacles=static_obs,
+                add_noise=False,  # No noise during evaluation
+            )
+
+            # Execute
+            lin_vel, ang_vel = map_action_to_cmd(action)
+            obs = eval_env.step(lin_vel, ang_vel)
+
+            episode_reward += obs['reward']
+            steps += 1
+
+        total_reward += episode_reward
+        total_col += int(obs['collision'])
+        total_goal += int(obs['goal_reached'])
+        total_steps += steps
+
+    n = len(scenarios)
+    avg_reward = total_reward / max(n, 1)
+    avg_col = total_col / max(n, 1)
+    avg_goal = total_goal / max(n, 1)
+    avg_steps = total_steps / max(n, 1)
+
+    model.writer.add_scalar("eval/avg_reward", avg_reward, log_step)
+    model.writer.add_scalar("eval/avg_col", avg_col, log_step)
+    model.writer.add_scalar("eval/avg_goal", avg_goal, log_step)
+    model.writer.add_scalar("eval/avg_steps", avg_steps, log_step)
+
+    print(
+        f"[EVAL #{eval_count}][step {log_step}] "
+        f"goal_rate={avg_goal:.2f} "
+        f"collision_rate={avg_col:.2f} "
+        f"avg_reward={avg_reward:.2f} "
+        f"avg_steps={avg_steps:.1f}"
+    )
+
+    np.random.set_state(rng_state_np)
+    random.setstate(rng_state_py)
+
+    return avg_reward, avg_col, avg_goal, avg_steps
+
+
+def is_better(curr: dict, best: dict | None) -> bool:
+    if best is None:
+        return True
+    if curr["avg_goal"] != best["avg_goal"]:
+        return curr["avg_goal"] > best["avg_goal"]
+    if curr["avg_col"] != best["avg_col"]:
+        return curr["avg_col"] < best["avg_col"]
+    if curr["avg_steps"] != best["avg_steps"]:
+        return curr["avg_steps"] < best["avg_steps"]
+    return False
+
+
+def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default="experiments/configs/defaults.json")
+    pre_args, _ = pre.parse_known_args()
+    cfg = load_config(pre_args.config)
+
+    parser = argparse.ArgumentParser(description="Train AIG-Nav (TD3)")
+    parser.add_argument("--config", default=pre_args.config)
+    parser.add_argument("--render", action="store_true", help="Enable rendering")
+    parser.add_argument("--render-fps", type=int, default=60)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--log-dir", default="experiments/runs/aig_nav_td3")
+    parser.add_argument("--model-dir", default="experiments/models/aig_nav_td3")
+    parser.add_argument("--run-name", default="")
+    parser.add_argument("--max-epochs", type=int, default=cfg_get(cfg, "train", "max_epochs", 300))
+    parser.add_argument("--episodes-per-epoch", type=int, default=cfg_get(cfg, "train", "episodes_per_epoch", 50))
+    parser.add_argument("--max-steps", type=int, default=cfg_get(cfg, "train", "max_steps", 500))
+    parser.add_argument("--total-steps", type=int, default=cfg_get(cfg, "train", "total_steps", None))
+    parser.add_argument("--eval-every-steps", type=int, default=cfg_get(cfg, "train", "eval_every_steps", None))
+    parser.add_argument("--eval-scenario-seed", type=int, default=cfg_get(cfg, "train", "eval_scenario_seed", DEFAULT_EVAL_SCENARIO_SEED))
+    parser.add_argument("--train-every-n", type=int, default=cfg_get(cfg, "train", "train_every_n", 2))
+    parser.add_argument("--training-iterations", type=int, default=cfg_get(cfg, "train", "training_iterations", 50))
+    parser.add_argument("--batch-size", type=int, default=cfg_get(cfg, "train", "batch_size", 128))
+    parser.add_argument("--random-steps", type=int, default=cfg_get(cfg, "train", "random_steps", 5000))
+    parser.add_argument("--buffer-size", type=int, default=1000000)
+    parser.add_argument("--num-pedestrians", type=int, default=cfg_get(cfg, "env", "num_pedestrians", 4))
+    parser.add_argument("--pedestrian-reactivity", type=float, default=cfg_get(cfg, "env", "pedestrian_reactivity", 0.0))
+    parser.add_argument("--pred-horizon", type=int, default=cfg_get(cfg, "env", "pred_horizon", 12))
+    parser.add_argument("--history-length", type=int, default=cfg_get(cfg, "env", "history_length", 10))
+    parser.add_argument("--num-candidate-actions", type=int, default=cfg_get(cfg, "model", "num_candidate_actions", 9))
+    parser.add_argument("--aig-hidden-dim", type=int, default=cfg_get(cfg, "model", "aig_hidden_dim", 128))
+    parser.add_argument("--aig-output-dim", type=int, default=cfg_get(cfg, "model", "aig_output_dim", 128))
+    # TD3 specific parameters
+    parser.add_argument("--expl-noise", type=float, default=0.2, help="Exploration noise std")  # Increased from 0.1
+    parser.add_argument("--policy-noise", type=float, default=0.2, help="Target policy smoothing noise")
+    parser.add_argument("--noise-clip", type=float, default=0.5, help="Noise clip range")
+    parser.add_argument("--policy-freq", type=int, default=2, help="Delayed policy update frequency")
+    # === IAIG parameters ===
+    parser.add_argument("--use-iterative-eq", type=int, default=cfg_get(cfg, "iaig", "use_iterative_eq", 0),
+                        help="1=IAIG-Nav (iterative eq, our primary method), 0=AIG-Nav (our predecessor design with discrete ActionSet)")
+    parser.add_argument("--K", type=int, default=cfg_get(cfg, "iaig", "K", 1),
+                        help="Number of equilibrium iterations")
+    parser.add_argument("--intention-dim", type=int, default=cfg_get(cfg, "iaig", "intention_dim", 64))
+    parser.add_argument("--lambda-conv", type=float, default=cfg_get(cfg, "iaig", "lambda_conv", 0.1))
+    # Sim-to-real parameters
+    parser.add_argument("--robot-radius", type=float, default=cfg_get(cfg, "env", "robot_radius", 0.25),
+                        help="Robot collision radius (meters)")
+    parser.add_argument("--scan-fov", type=float, default=cfg_get(cfg, "env", "scan_fov", math.pi / 2),
+                        help="LiDAR half-FOV in radians (pi/2 = front 180°)")
+    parser.add_argument("--scan-noise-std", type=float, default=cfg_get(cfg, "env", "scan_noise_std", 0.005),
+                        help="LiDAR Gaussian noise std (meters)")
+    # Domain randomization parameters
+    parser.add_argument("--randomize-obstacles", type=int, default=cfg_get(cfg, "train", "randomize_obstacles", 1),
+                        help="Randomize static obstacles each episode (0/1)")
+    parser.add_argument("--randomize-num-peds", type=int, default=cfg_get(cfg, "train", "randomize_num_pedestrians", 1),
+                        help="Randomize pedestrian count each episode (0/1)")
+    parser.add_argument("--ped-speed-min", type=float, default=cfg_get(cfg, "train", "ped_speed_min", 0.5),
+                        help="Min pedestrian speed for randomization")
+    parser.add_argument("--ped-speed-max", type=float, default=cfg_get(cfg, "train", "ped_speed_max", 1.0),
+                        help="Max pedestrian speed for randomization")
+    args = parser.parse_args()
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("[WARN] CUDA not available, using CPU")
+        args.device = "cpu"
+
+    if args.total_steps is None:
+        args.total_steps = args.max_epochs * args.episodes_per_epoch * args.max_steps
+    if args.eval_every_steps is None:
+        args.eval_every_steps = args.episodes_per_epoch * args.max_steps
+    if args.eval_every_steps <= 0:
+        raise ValueError("eval_every_steps must be positive")
+    if args.total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if args.total_steps < args.eval_every_steps:
+        print("[WARN] total_steps < eval_every_steps; only one eval will run.")
+    elif args.total_steps % args.eval_every_steps != 0:
+        print("[WARN] total_steps is not divisible by eval_every_steps; last eval may be skipped.")
+
+    set_seed(args.seed, deterministic=args.deterministic)
+
+    run_name = args.run_name.strip() or time.strftime("%Y%m%d_%H%M%S")
+    if args.seed is not None and f"seed{args.seed}" not in run_name:
+        run_name = f"{run_name}_seed{args.seed}"
+
+    print("=" * 60)
+    print("AIG-Nav: Action-conditioned Interaction Graph (TD3 Optimizer)")
+    print("=" * 60)
+    print("Key Differences from SAC:")
+    print("  - Deterministic policy with exploration noise")
+    print("  - Target policy smoothing")
+    print("  - Delayed policy updates")
+    print("=" * 60)
+
+    # Create environment
+    env = PygameNavEnvAIGNav(
+        render=args.render,
+        render_fps=args.render_fps,
+        num_pedestrians=args.num_pedestrians,
+        pedestrian_reactivity=args.pedestrian_reactivity,
+        seed=args.seed,
+        history_length=args.history_length,
+        prediction_horizon=args.pred_horizon,
+        robot_radius=args.robot_radius,
+        scan_fov=args.scan_fov,
+        scan_noise_std=args.scan_noise_std,
+        randomize_obstacles=bool(args.randomize_obstacles),
+        randomize_num_pedestrians=bool(args.randomize_num_peds),
+        ped_speed_range=(args.ped_speed_min, args.ped_speed_max),
+    )
+    eval_env = PygameNavEnvAIGNav(
+        render=False,
+        render_fps=args.render_fps,
+        num_pedestrians=args.num_pedestrians,
+        pedestrian_reactivity=args.pedestrian_reactivity,
+        seed=args.seed,
+        history_length=args.history_length,
+        prediction_horizon=args.pred_horizon,
+        robot_radius=args.robot_radius,
+        scan_fov=args.scan_fov,
+        scan_noise_std=args.scan_noise_std,
+        # Eval env: no randomization for reproducibility
+        randomize_obstacles=False,
+        randomize_num_pedestrians=False,
+        ped_speed_range=(args.ped_speed_min, args.ped_speed_max),
+    )
+
+    # Get observation dimensions
+    obs = env.reset()
+    scan_dim = len(obs['scan'])
+    core_dim = 3
+    action_dim = 2
+
+    # Compute max capacities for variable-size inputs
+    if args.randomize_num_peds:
+        max_peds = max(args.num_pedestrians, env.num_pedestrians_range[1]) + 2
+    else:
+        max_peds = args.num_pedestrians + 2
+    if args.randomize_obstacles:
+        max_static = max(len(env.static_obstacles), env.num_obstacles_range[1])
+    else:
+        max_static = len(env.static_obstacles)
+
+    print(f"[INFO] Scan dim: {scan_dim}")
+    print(f"[INFO] Core dim: {core_dim}")
+    print(f"[INFO] Num pedestrians: {args.num_pedestrians} (max_peds={max_peds})")
+
+    # Create model
+    save_dir = Path(args.model_dir) / run_name
+    os.makedirs(save_dir, exist_ok=True)
+
+    model = AIGNavTD3(
+        scan_dim=scan_dim,
+        core_dim=core_dim,
+        action_dim=action_dim,
+        device=args.device,
+        max_action=1.0,
+        # TD3 hyperparameters
+        discount=0.99,
+        tau=0.005,
+        policy_noise=args.policy_noise,
+        noise_clip=args.noise_clip,
+        policy_freq=args.policy_freq,
+        actor_lr=3e-4,
+        critic_lr=3e-4,
+        expl_noise=args.expl_noise,
+        # AIG encoder parameters
+        aig_hidden_dim=args.aig_hidden_dim,
+        aig_output_dim=args.aig_output_dim,
+        pred_horizon=args.pred_horizon,
+        max_pedestrians=max_peds,
+        history_length=args.history_length,
+        max_static_obstacles=max_static,
+        goal_distance_scale=getattr(env, "max_goal_dist", 6.0),
+        num_candidate_actions=args.num_candidate_actions,
+        aux_pred_loss_weight=0.5,
+        hidden_dim=256,
+        hidden_depth=2,
+        save_every=0,
+        save_directory=save_dir,
+        model_name="AIGNavTD3_v1",
+        # === IAIG parameters ===
+        use_iterative_eq=bool(args.use_iterative_eq),
+        K=args.K,
+        intention_dim=args.intention_dim,
+        lambda_conv=args.lambda_conv,
+        robot_radius=args.robot_radius,
+    )
+
+    # Setup logging
+    log_dir = Path(args.log_dir)
+    run_dir = log_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    model.writer = SummaryWriter(log_dir=str(run_dir))
+    print(f"[INFO] TensorBoard logs: {run_dir}")
+
+    config_path = run_dir / "config.json"
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump({"args": vars(args)}, f, indent=2)
+
+    best_metrics = None
+    best_dir = save_dir / "best"
+    best_metrics_path = best_dir / "best_eval.json"
+
+    # Create replay buffer
+    replay_buffer = AIGNavReplayBuffer(
+        buffer_size=args.buffer_size,
+        scan_dim=scan_dim,
+        core_dim=core_dim,
+        action_dim=action_dim,
+        max_pedestrians=max_peds,
+        history_length=args.history_length,
+        max_static_obstacles=max_static,
+        device=args.device,
+    )
+
+    # Evaluation scenarios (generated, fixed seed)
+    train_eval_episodes = cfg_get(cfg, "eval", "episodes", 100)
+    eval_scenarios = generate_eval_scenarios(
+        eval_env, int(train_eval_episodes), seed=args.eval_scenario_seed
+    )
+
+    # Training state
+    epoch = 0
+    episode = 0
+    steps = 0
+    total_steps = 0
+    episode_reward = 0.0
+    next_eval_step = args.eval_every_steps
+    eval_count = 0
+    progress_width = 20
+    progress_interval = max(int(args.eval_every_steps // progress_width), 1)
+    progress_update = max(int(args.eval_every_steps // 200), 1)
+    last_eval_step = 0
+    next_progress = progress_interval
+    progress_bar = None
+    progress_count = 0
+
+    # Get initial observation
+    ped_states = obs['pedestrian_states']
+    ped_pos = ped_states['positions']
+    ped_vel = ped_states['velocities']
+    ped_hist = ped_states['histories']
+    ped_pos_world = ped_states['positions_world']
+    static_obs = obs['static_obstacles']
+    robot_pose = obs['robot_pose']
+    scan = obs['scan']
+    distance = obs['distance']
+    cos_v = obs['cos_v']
+    sin_v = obs['sin_v']
+
+    method_name = "IAIG-Nav (TD3)" if args.use_iterative_eq else "AIG-Nav (TD3)"
+    print("=" * 60)
+    print(f"{method_name} Training")
+    print(f"run={run_name} seed={args.seed} device={args.device}")
+    if args.use_iterative_eq:
+        print(f"IAIG: K={args.K} intention_dim={args.intention_dim} lambda_conv={args.lambda_conv}")
+    print(
+        f"total_steps={args.total_steps} eval_every_steps={args.eval_every_steps} "
+        f"eval_scenario_seed={args.eval_scenario_seed}"
+    )
+    print(
+        f"env: pedestrians={args.num_pedestrians} reactivity={args.pedestrian_reactivity} "
+        f"pred_horizon={args.pred_horizon} history={args.history_length}"
+    )
+    print(
+        f"td3: expl_noise={args.expl_noise} policy_noise={args.policy_noise} "
+        f"policy_freq={args.policy_freq}"
+    )
+    print(
+        f"sim2real: robot_radius={args.robot_radius} "
+        f"scan_fov={math.degrees(args.scan_fov * 2):.0f}° "
+        f"scan_noise_std={args.scan_noise_std}"
+    )
+    print(
+        f"domain_rand: obstacles={bool(args.randomize_obstacles)} "
+        f"num_peds={bool(args.randomize_num_peds)} "
+        f"ped_speed=[{args.ped_speed_min}, {args.ped_speed_max}]"
+    )
+    print("=" * 60)
+    progress_bar = make_progress_bar(args.eval_every_steps, "train")
+
+    while total_steps < args.total_steps:
+        # Prepare state
+        norm_distance = min(distance / 6.0, 1.0)
+        core = np.array([norm_distance, cos_v, sin_v], dtype=np.float32)
+
+        # Select action
+        if total_steps < args.random_steps:
+            # Random exploration
+            action = np.array([
+                np.random.uniform(-0.3, 1.0),
+                np.random.uniform(-1.0, 1.0),
+            ], dtype=np.float32)
+            action = np.clip(action, -1.0, 1.0)
+        else:
+            # TD3: Deterministic action with exploration noise
+            action = model.act(
+                scan,
+                core,
+                ped_pos,
+                ped_vel,
+                ped_histories=ped_hist,
+                static_obstacles=static_obs,
+                add_noise=True,  # Add exploration noise during training
+            )
+
+        # Execute action
+        lin_vel, ang_vel = map_action_to_cmd(action)
+        next_obs = env.step(lin_vel, ang_vel)
+
+        # Get next state
+        next_ped_states = next_obs['pedestrian_states']
+        next_ped_pos = next_ped_states['positions']
+        next_ped_vel = next_ped_states['velocities']
+        next_ped_hist = next_ped_states['histories']
+        next_ped_pos_world = next_ped_states['positions_world']
+        next_static_obs = next_obs['static_obstacles']
+        next_scan = next_obs['scan']
+        next_distance = next_obs['distance']
+        next_cos = next_obs['cos_v']
+        next_sin = next_obs['sin_v']
+
+        next_norm_distance = min(next_distance / 6.0, 1.0)
+        next_core = np.array([next_norm_distance, next_cos, next_sin], dtype=np.float32)
+
+        reward = next_obs['reward']
+        collision = next_obs['collision']
+        goal = next_obs['goal_reached']
+        episode_done = collision or goal or (steps + 1) >= args.max_steps
+
+        # Store transition
+        replay_buffer.add(
+            scan=scan,
+            core=core,
+            action=action,
+            reward=reward,
+            next_scan=next_scan,
+            next_core=next_core,
+            done=episode_done,
+            ped_positions=ped_pos,
+            ped_velocities=ped_vel,
+            ped_histories=ped_hist,
+            next_ped_positions=next_ped_pos,
+            next_ped_velocities=next_ped_vel,
+            next_ped_histories=next_ped_hist,
+            static_obstacles=static_obs,
+            next_static_obstacles=next_static_obs,
+            ped_positions_world=ped_pos_world,
+            next_ped_positions_world=next_ped_pos_world,
+            robot_pose=robot_pose,
+        )
+
+        episode_reward += reward
+
+        # Update state
+        scan = next_scan
+        distance = next_distance
+        cos_v = next_cos
+        sin_v = next_sin
+        ped_pos = next_ped_pos
+        ped_vel = next_ped_vel
+        ped_hist = next_ped_hist
+        ped_pos_world = next_ped_pos_world
+        robot_pose = next_obs['robot_pose']
+        static_obs = next_static_obs
+
+        steps += 1
+        total_steps += 1
+
+        progress_since_eval = total_steps - last_eval_step
+        if progress_bar is not None:
+            progress_target = min(progress_since_eval, args.eval_every_steps)
+            delta = progress_target - progress_count
+            if delta >= progress_update or progress_target == args.eval_every_steps:
+                progress_bar.update(delta)
+                progress_count += delta
+        elif progress_since_eval >= next_progress:
+            bar, ratio = format_progress_bar(progress_since_eval, args.eval_every_steps, progress_width)
+            print(
+                f"[PROGRESS] {progress_since_eval}/{args.eval_every_steps} {bar} "
+                f"{ratio * 100:5.1f}% step={total_steps}"
+            )
+            next_progress += progress_interval
+
+        if total_steps >= next_eval_step:
+            while total_steps >= next_eval_step:
+                eval_count += 1
+                avg_reward, avg_col, avg_goal, avg_steps = evaluate(
+                    model,
+                    eval_env,
+                    eval_scenarios,
+                    next_eval_step,
+                    args.max_steps,
+                    seed_base=args.eval_scenario_seed,
+                    eval_count=eval_count,
+                )
+                current = {
+                    "step": next_eval_step,
+                    "eval_count": eval_count,
+                    "avg_reward": avg_reward,
+                    "avg_col": avg_col,
+                    "avg_goal": avg_goal,
+                    "avg_steps": avg_steps,
+                    "criteria": "goal_rate desc, collision_rate asc, avg_steps asc",
+                }
+                if is_better(current, best_metrics):
+                    best_metrics = current
+                    model.save(best_dir)
+                    with best_metrics_path.open("w", encoding="utf-8") as f:
+                        json.dump(best_metrics, f, indent=2)
+                    print(
+                        f"[BEST][step {next_eval_step}] "
+                        f"goal_rate={avg_goal:.2f} "
+                        f"collision_rate={avg_col:.2f} "
+                        f"avg_reward={avg_reward:.2f} "
+                        f"avg_steps={avg_steps:.1f}"
+                    )
+                if progress_bar is not None:
+                    remaining = args.eval_every_steps - progress_count
+                    if remaining > 0:
+                        progress_bar.update(remaining)
+                    progress_bar.close()
+                    progress_bar = make_progress_bar(args.eval_every_steps, "train")
+                    progress_count = 0
+                else:
+                    next_progress = progress_interval
+                last_eval_step = next_eval_step
+                next_eval_step += args.eval_every_steps
+
+        # Episode end
+        if episode_done:
+            episode += 1
+            episode_reward = 0.0
+
+            # Training
+            if episode % args.train_every_n == 0 and len(replay_buffer) > args.batch_size:
+                model.train(
+                    replay_buffer=replay_buffer,
+                    iterations=args.training_iterations,
+                    batch_size=args.batch_size,
+                )
+
+            # Epoch boundary
+            if episode % args.episodes_per_epoch == 0:
+                epoch += 1
+                episode = 0
+
+            # Reset
+            obs = env.reset()
+            model.reset_episode()
+
+            ped_states = obs['pedestrian_states']
+            ped_pos = ped_states['positions']
+            ped_vel = ped_states['velocities']
+            ped_hist = ped_states['histories']
+            ped_pos_world = ped_states['positions_world']
+            static_obs = obs['static_obstacles']
+            robot_pose = obs['robot_pose']
+            scan = obs['scan']
+            distance = obs['distance']
+            cos_v = obs['cos_v']
+            sin_v = obs['sin_v']
+            steps = 0
+
+    if progress_bar is not None:
+        progress_bar.close()
+
+    # Save final model and run final evaluation
+    final_dir = save_dir / "final"
+    model.save(final_dir)
+    eval_count += 1
+    avg_reward, avg_col, avg_goal, avg_steps = evaluate(
+        model, eval_env, eval_scenarios, total_steps,
+        args.max_steps, seed_base=args.eval_scenario_seed,
+        eval_count=eval_count,
+    )
+    final_metrics = {
+        "step": total_steps,
+        "eval_count": eval_count,
+        "avg_reward": avg_reward,
+        "avg_col": avg_col,
+        "avg_goal": avg_goal,
+        "avg_steps": avg_steps,
+    }
+    final_metrics_path = final_dir / "final_eval.json"
+    with final_metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(final_metrics, f, indent=2)
+    print(
+        f"[FINAL][step {total_steps}] "
+        f"goal_rate={avg_goal:.2f} "
+        f"collision_rate={avg_col:.2f} "
+        f"avg_reward={avg_reward:.2f} "
+        f"avg_steps={avg_steps:.1f}"
+    )
+
+    env.close()
+    eval_env.close()
+    print("[INFO] Training complete!")
+
+
+if __name__ == "__main__":
+    main()

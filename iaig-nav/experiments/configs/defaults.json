@@ -1,0 +1,48 @@
+{
+  "env": {
+    "num_pedestrians": 4,
+    "pedestrian_reactivity": 0.3,
+    "pred_horizon": 12,
+    "history_length": 10
+  },
+  "model": {
+    "aig_hidden_dim": 128,
+    "aig_output_dim": 128,
+    "num_candidate_actions": 9,
+    "aux_pred_loss_weight": 0.5
+  },
+  "train": {
+    "max_epochs": 100,
+    "episodes_per_epoch": 50,
+    "max_steps": 500,
+    "total_steps": 1500000,
+    "eval_every_steps": 15000,
+    "eval_scenario_seed": 12345,
+    "train_every_n": 4,
+    "training_iterations": 50,
+    "batch_size": 128,
+    "random_steps": 5000
+  },
+  "eval": {
+    "episodes": 100,
+    "max_steps": 500,
+    "eval_scenario_seed": 54321,
+    "noise_stds": "0.0,0.05,0.1,0.2",
+    "near_miss_margin": 0.3
+  },
+  "benchmark": {
+    "steps": 2000,
+    "warmup": 200,
+    "mode": "act_only"
+  },
+  "render_test": {
+    "episodes": 5,
+    "max_steps": 500
+  },
+  "iaig": {
+    "use_iterative_eq": 1,
+    "K": 1,
+    "intention_dim": 64,
+    "lambda_conv": 0.1
+  }
+}

@@ -1,0 +1,156 @@
+{
+  "name": "iaig_nav_td3_ablation",
+  "defaults_config": "experiments/configs/defaults.json",
+  "variants": [
+    "K0",
+    "K1",
+    "K3",
+    "K5",
+    "no_conv_loss",
+    "no_aux_pred",
+    "fixed_graph",
+    "no_reactive",
+    "no_cond_graph",
+    "no_pred_edge"
+  ],
+  "baselines": [],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "train": {
+    "device": "cuda",
+    "total_steps": 1000000,
+    "eval_every_steps": 10000,
+    "eval_scenario_seed": 12345,
+    "train_every_n": 4,
+    "training_iterations": 50,
+    "batch_size": 128,
+    "buffer_size": 1000000,
+    "random_steps": 5000,
+    "num_pedestrians": 4,
+    "pedestrian_reactivity": 0.3,
+    "pred_horizon": 12,
+    "history_length": 10,
+    "num_candidate_actions": 9,
+    "aux_pred_loss_weight": 0.5,
+    "aig_hidden_dim": 128,
+    "aig_output_dim": 128,
+    "deterministic": false,
+    "use_iterative_eq": 1,
+    "K": 1,
+    "intention_dim": 64,
+    "lambda_conv": 0.1,
+    "randomize_obstacles": 1,
+    "randomize_num_pedestrians": 1,
+    "ped_speed_min": 0.5,
+    "ped_speed_max": 1.0,
+    "robot_radius": 0.25,
+    "scan_fov": 1.5707963267948966,
+    "scan_noise_std": 0.005
+  },
+  "eval": {
+    "device": "cuda",
+    "episodes": 100,
+    "max_steps": 500,
+    "eval_scenario_seed": 54321,
+    "pred_horizon": 12,
+    "history_length": 10,
+    "num_candidate_actions": 9,
+    "aig_hidden_dim": 128,
+    "aig_output_dim": 128,
+    "num_pedestrians": 4,
+    "pedestrian_reactivity": 0.3,
+    "noise_stds": "0.0",
+    "near_miss_margin": 0.3,
+    "deterministic": false,
+    "use_iterative_eq": 1,
+    "K": 1,
+    "intention_dim": 64,
+    "lambda_conv": 0.1,
+    "robot_radius": 0.25,
+    "scan_fov": 1.5707963267948966,
+    "scan_noise_std": 0.005
+  },
+  "sweeps": {},
+  "variant_overrides": {
+    "K0": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py",
+      "train": {
+        "K": 0,
+        "use_iterative_eq": 1,
+        "lambda_conv": 0.0
+      },
+      "eval": {
+        "K": 0,
+        "use_iterative_eq": 1,
+        "lambda_conv": 0.0
+      }
+    },
+    "K1": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py",
+      "train": {
+        "K": 1
+      },
+      "eval": {
+        "K": 1
+      }
+    },
+    "K3": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py",
+      "train": {
+        "K": 3
+      },
+      "eval": {
+        "K": 3
+      }
+    },
+    "K5": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py",
+      "train": {
+        "K": 5
+      },
+      "eval": {
+        "K": 5
+      }
+    },
+    "no_conv_loss": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py",
+      "train": {
+        "lambda_conv": 0.0
+      },
+      "eval": {
+        "lambda_conv": 0.0
+      }
+    },
+    "no_aux_pred": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py",
+      "train": {
+        "aux_pred_loss_weight": 0.0
+      }
+    },
+    "fixed_graph": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py"
+    },
+    "no_reactive": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py"
+    },
+    "no_cond_graph": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py"
+    },
+    "no_pred_edge": {
+      "train_script": "ablations/train_ablation_td3.py",
+      "eval_script": "ablations/evaluate_ablation_td3.py"
+    }
+  }
+}

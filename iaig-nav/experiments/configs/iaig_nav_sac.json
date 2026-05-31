@@ -1,0 +1,136 @@
+{
+  "name": "iaig_nav_sac",
+  "defaults_config": "experiments/configs/defaults.json",
+  "variants": [
+    "iaig_nav",
+    "aig_nav"
+  ],
+  "baselines": [],
+  "seeds": [
+    0
+  ],
+  "train": {
+    "device": "cuda",
+    "max_epochs": 100,
+    "episodes_per_epoch": 50,
+    "max_steps": 500,
+    "total_steps": 1000000,
+    "eval_every_steps": 10000,
+    "eval_scenario_seed": 12345,
+    "train_every_n": 4,
+    "training_iterations": 50,
+    "batch_size": 128,
+    "buffer_size": 1000000,
+    "random_steps": 5000,
+    "num_pedestrians": 4,
+    "pedestrian_reactivity": 0.3,
+    "pred_horizon": 12,
+    "history_length": 10,
+    "num_candidate_actions": 9,
+    "aux_pred_loss_weight": 0.5,
+    "aig_hidden_dim": 128,
+    "aig_output_dim": 128,
+    "deterministic": false,
+    "use_iterative_eq": 1,
+    "K": 3,
+    "intention_dim": 64,
+    "lambda_conv": 0.1,
+    "randomize_obstacles": 1,
+    "randomize_num_pedestrians": 1,
+    "ped_speed_min": 0.5,
+    "ped_speed_max": 1.0,
+    "robot_radius": 0.25,
+    "scan_fov": 1.5707963267948966,
+    "scan_noise_std": 0.005
+  },
+  "eval": {
+    "device": "cuda",
+    "episodes": 100,
+    "max_steps": 500,
+    "eval_scenario_seed": 54321,
+    "pred_horizon": 12,
+    "history_length": 10,
+    "num_candidate_actions": 9,
+    "aig_hidden_dim": 128,
+    "aig_output_dim": 128,
+    "num_pedestrians": 4,
+    "pedestrian_reactivity": 0.3,
+    "noise_stds": "0.0,0.05,0.1,0.2",
+    "near_miss_margin": 0.3,
+    "deterministic": false,
+    "use_iterative_eq": 1,
+    "K": 3,
+    "intention_dim": 64,
+    "lambda_conv": 0.1,
+    "robot_radius": 0.25,
+    "scan_fov": 1.5707963267948966,
+    "scan_noise_std": 0.005
+  },
+  "sweeps": {
+    "num_pedestrians": [
+      2,
+      4,
+      6,
+      8
+    ],
+    "pedestrian_reactivity": [
+      0.0,
+      0.3,
+      0.6
+    ]
+  },
+  "train_order": [
+    {
+      "type": "variant",
+      "name": "iaig_nav"
+    },
+    {
+      "type": "variant",
+      "name": "aig_nav"
+    },
+    {
+      "type": "baseline",
+      "name": "iaig_nav_td3"
+    },
+    {
+      "type": "baseline",
+      "name": "sb3_sac"
+    },
+    {
+      "type": "baseline",
+      "name": "sb3_td3"
+    }
+  ],
+  "eval_order": [
+    {
+      "type": "variant",
+      "name": "iaig_nav"
+    },
+    {
+      "type": "variant",
+      "name": "aig_nav"
+    },
+    {
+      "type": "baseline",
+      "name": "iaig_nav_td3"
+    },
+    {
+      "type": "baseline",
+      "name": "sb3_sac"
+    },
+    {
+      "type": "baseline",
+      "name": "sb3_td3"
+    }
+  ],
+  "variant_overrides": {
+    "aig_nav": {
+      "train": {
+        "use_iterative_eq": 0
+      },
+      "eval": {
+        "use_iterative_eq": 0
+      }
+    }
+  }
+}
